@@ -25,8 +25,10 @@ import com.hazelcast.instance.OutOfMemoryErrorDispatcher;
 import com.hazelcast.logging.ILogger;
 import com.hazelcast.nio.Address;
 import com.hazelcast.nio.Connection;
+import com.hazelcast.nio.ConnectionType;
 import com.hazelcast.nio.IOUtil;
 import com.hazelcast.nio.Packet;
+import com.hazelcast.nio.SocketWritable;
 import com.hazelcast.nio.serialization.Data;
 import com.hazelcast.partition.InternalPartition;
 import com.hazelcast.partition.InternalPartitionService;
@@ -60,6 +62,8 @@ import com.hazelcast.util.ExceptionUtil;
 import com.hazelcast.util.executor.ExecutorType;
 import com.hazelcast.util.executor.ManagedExecutorService;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -140,6 +144,7 @@ final class BasicOperationService implements InternalOperationService {
     private final OperationPacketHandler operationPacketHandler;
     private final ResponsePacketHandler responsePacketHandler;
     private final OperationTimeoutHandlerThread operationTimeoutHandlerThread;
+    private final boolean backPressureEnabled;
     private volatile boolean shutdown;
 
     private final BackoffPolicy backoffPolicy;
@@ -151,7 +156,7 @@ final class BasicOperationService implements InternalOperationService {
         this.invocationLogger = nodeEngine.getLogger(BasicInvocation.class);
         this.defaultCallTimeoutMillis = node.getGroupProperties().OPERATION_CALL_TIMEOUT_MILLIS.getLong();
         this.backupOperationTimeoutMillis = node.getGroupProperties().OPERATION_BACKUP_TIMEOUT_MILLIS.getLong();
-
+        this.backPressureEnabled = node.getGroupProperties().BACKPRESSURE_ENABLED.getBoolean();
         this.executionService = nodeEngine.getExecutionService();
 
         int coreSize = Runtime.getRuntime().availableProcessors();
@@ -263,8 +268,118 @@ final class BasicOperationService implements InternalOperationService {
         }
     }
 
+
+    private class LocalConnection implements Connection{
+        @Override
+        public WriteResult write(SocketWritable packet) {
+            return null;
+        }
+
+        @Override
+        public WriteResult writeBackup(Packet packet) {
+            return null;
+        }
+
+        @Override
+        public boolean isFull() {
+            return false;
+        }
+
+        @Override
+        public boolean isAlive() {
+            return false;
+        }
+
+        @Override
+        public long lastReadTime() {
+            return 0;
+        }
+
+        @Override
+        public long lastWriteTime() {
+            return 0;
+        }
+
+        @Override
+        public void close() {
+
+        }
+
+        @Override
+        public ConnectionType getType() {
+            return null;
+        }
+
+        @Override
+        public boolean isClient() {
+            return false;
+        }
+
+        @Override
+        public InetAddress getInetAddress() {
+            return null;
+        }
+
+        @Override
+        public InetSocketAddress getRemoteSocketAddress() {
+            return null;
+        }
+
+        @Override
+        public Address getEndPoint() {
+            return null;
+        }
+
+        @Override
+        public int getPort() {
+            return 0;
+        }
+
+        @Override
+        public void setAvailableSlots(int claimResponse) {
+
+        }
+    }
+
+    public final AtomicLong localClaim = new AtomicLong();
+    private final Connection localConnection = new LocalConnection();
+
     @Override
-    public void executeOperation(final Operation op) {
+    public void executeOperation(Operation op) {
+        if(backPressureEnabled && !op.isUrgent()) {
+            int maxAttempts = 1000000;
+            int state = BackoffPolicy.EMPTY_STATE;
+
+            for (int i = 0; i < maxAttempts; i++) {
+                long current = localClaim.get();
+                if (current > 1) {
+                    // there is enough space, so try to reduce the claims by one and if we manage successfully we are done.
+                    long update = current - 1;
+                    if (localClaim.compareAndSet(current, update)) {
+                        break;
+                    }
+                } else {
+                    // there is current 0 or 1 slot available.
+
+                    if (current == 1) {
+                        // there is 1 slot remaining, it is now our responsibility to acquire a new claim
+                        if (localClaim.compareAndSet(1, 0)) {
+                            // it is now our responsibility to get a claim.
+
+                            int newClaim = node.nodeEngine.getClaimAccounting().claimSlots(localConnection);
+
+                            // if we managed to get a useful claim, we are going to set it. Else we'll do a backoff.
+                            if (newClaim > 0) {
+                                localClaim.set(newClaim);
+                                break;
+                            }
+                        }
+                    }
+
+                     state = backoffPolicy.apply(state);
+                }
+            }
+        }
         scheduler.execute(op);
     }
 
