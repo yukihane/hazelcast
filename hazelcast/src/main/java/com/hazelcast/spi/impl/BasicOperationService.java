@@ -347,39 +347,64 @@ final class BasicOperationService implements InternalOperationService {
     @Override
     public void executeOperation(Operation op) {
         if(backPressureEnabled && !op.isUrgent()) {
-            int maxAttempts = 1000000;
-            int state = BackoffPolicy.EMPTY_STATE;
-
-            for (int i = 0; i < maxAttempts; i++) {
-                long current = localClaim.get();
-                if (current > 1) {
-                    // there is enough space, so try to reduce the claims by one and if we manage successfully we are done.
-                    long update = current - 1;
-                    if (localClaim.compareAndSet(current, update)) {
-                        break;
-                    }
-                } else {
-                    // there is current 0 or 1 slot available.
-
-                    if (current == 1) {
-                        // there is 1 slot remaining, it is now our responsibility to acquire a new claim
-                        if (localClaim.compareAndSet(1, 0)) {
-                            // it is now our responsibility to get a claim.
-
-                            int newClaim = node.nodeEngine.getClaimAccounting().claimSlots(localConnection);
-
-                            // if we managed to get a useful claim, we are going to set it. Else we'll do a backoff.
-                            if (newClaim > 0) {
-                                localClaim.set(newClaim);
-                                break;
-                            }
+            long newClaimSize = localClaim.decrementAndGet();
+            if (newClaimSize <= 0) {
+                int backoffState = BackoffPolicy.EMPTY_STATE;
+                for (; ; ) {
+                    if (newClaimSize == 0) {
+                        // we were the thread that managed to get the last slot, so we are responsible for claiming the slot
+                        int newClaim = node.nodeEngine.getClaimAccounting().claimSlots(localConnection);
+                        if (newClaim > 0) {
+                            // if we got useful claims,
+                            localClaim.set(newClaim);
+                            break;
                         }
                     }
 
-                     state = backoffPolicy.apply(state);
+                    if (localClaim.get() > 0) {
+                        break;
+                    }
+                    backoffPolicy.apply(backoffState);
+                    backoffState = backoffPolicy.nextState(backoffState);
                 }
             }
         }
+//        if(backPressureEnabled && !op.isUrgent()) {
+//            int maxAttempts = 1000000;
+//            int state = BackoffPolicy.EMPTY_STATE;
+//
+//            for (int i = 0; i < maxAttempts; i++) {
+//                long current = localClaim.get();
+//                if (current > 1) {
+//                    // there is enough space, so try to reduce the claims by one and if we manage successfully we are done.
+//                    long update = current - 1;
+//                    if (localClaim.compareAndSet(current, update)) {
+//                        break;
+//                    }
+//                } else {
+//                    // there is current 0 or 1 slot available.
+//
+//                    if (current == 1) {
+//                        // there is 1 slot remaining, it is now our responsibility to acquire a new claim
+//                        if (localClaim.compareAndSet(1, 0)) {
+//                            // it is now our responsibility to get a claim.
+//
+//                            int newClaim = node.nodeEngine.getClaimAccounting().claimSlots(localConnection);
+//
+//                            // if we managed to get a useful claim, we are going to set it. Else we'll do a backoff.
+//                            if (newClaim > 0) {
+//                                localClaim.set(newClaim);
+//                                break;
+//                            }
+//                        }
+//                    }
+//
+//                     state = backoffPolicy.apply(state);
+//                }
+//            }
+//        }
+
+
         scheduler.execute(op);
     }
 
