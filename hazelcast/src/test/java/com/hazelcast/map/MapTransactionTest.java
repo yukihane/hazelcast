@@ -1336,4 +1336,66 @@ public class MapTransactionTest extends HazelcastTestSupport {
         context.commitTransaction();
         assertOpenEventually("Not reached expected update event count", expectedUpdateEventCount);
     }
+
+    @Test
+    public void testRepeatableRead() throws Throwable {
+        final TestHazelcastInstanceFactory factory = createHazelcastInstanceFactory(2);
+        final HazelcastInstance instance1 = factory.newHazelcastInstance();
+        final HazelcastInstance instance2 = factory.newHazelcastInstance();
+
+        final CountDownLatch read1Cdl = new CountDownLatch(1);
+        final CountDownLatch otherUpdCdl = new CountDownLatch(1);
+
+        final String key = "key";
+
+        final IMap<String, String> map = instance1.getMap("test");
+        map.put(key, "value1");
+
+        class TransactionThread extends Thread {
+
+            private volatile Throwable throwable;
+
+            public TransactionThread() {
+                setUncaughtExceptionHandler(new UncaughtExceptionHandler() {
+                    @Override
+                    public void uncaughtException(final Thread t, final Throwable e) {
+                        throwable = e;
+                    }
+                });
+            }
+
+            @Override
+            public void run() {
+                final TransactionContext ctx = instance2.newTransactionContext();
+                ctx.beginTransaction();
+                try {
+                    final TransactionalMap<String, String> txnMap = ctx.getMap("test");
+                    assertEquals("value1", txnMap.get(key));
+
+                    read1Cdl.countDown();
+                    otherUpdCdl.await();
+
+                    assertEquals("get same value", "value1", txnMap.get(key));
+
+                } catch (final InterruptedException e) {
+                    throw new RuntimeException(e);
+                } finally {
+                    ctx.rollbackTransaction();
+                }
+            }
+        }
+
+        final TransactionThread t = new TransactionThread();
+        t.start();
+
+        read1Cdl.await();
+        map.put(key, "value2");
+        otherUpdCdl.countDown();
+
+        t.join();
+
+        if (t.throwable != null) {
+            throw t.throwable;
+        }
+    }
 }
